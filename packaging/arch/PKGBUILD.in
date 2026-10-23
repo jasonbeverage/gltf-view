@@ -10,6 +10,7 @@ url="https://github.com/jasonbeverage/gltf-view"
 license=('MIT')
 depends=('gcc-libs' 'glibc' 'fontconfig' 'freetype2' 'libxkbcommon' 'libxkbcommon-x11' 'libxcb' 'wayland' 'vulkan-icd-loader')
 optdepends=('vulkan-driver: GPU rendering (mesa or your vendor driver)')
+options=('!debug' '!strip')  # prebuilt, already stripped binary
 provides=('gltf-view')
 conflicts=('gltf-view')
 source=("gltf-view-$pkgver.tar.gz::$url/releases/download/v$pkgver/gltf-view-linux-x86_64.tar.gz")
