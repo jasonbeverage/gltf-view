@@ -41,6 +41,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Caches saved by tag or PR runs can't be reused by later runs; only main saves.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Locate Windows SDK shader compiler and libclang
         shell: pwsh
@@ -102,6 +105,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Caches saved by tag or PR runs can't be reused by later runs; only main saves.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $LINUX_DEPS
       - run: cargo build --release --locked
 
