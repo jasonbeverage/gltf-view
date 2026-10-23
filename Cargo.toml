@@ -1,0 +1,39 @@
+[package]
+name = "gltf-view"
+version = "0.1.0"
+edition = "2024"
+description = "Fast glTF / GLB viewer with property inspector"
+license = "MIT"
+repository = "https://github.com/jasonbeverage/gltf-view"
+
+[dependencies]
+gpui = "0.2.2"
+wgpu = "30"
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
+glam = { version = "0.30", features = ["bytemuck"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "rayon"] }
+meshopt = "0.7"
+draco-core = { version = "2.3", default-features = false, features = ["decoder", "point_cloud_decode", "edgebreaker_valence_decode", "legacy_bitstream_decode"] }
+basisu_c_sys = { version = "0.9", features = ["extra"] }
+ktx2 = "0.5"
+ruzstd = "0.9"
+rayon = "1"
+anyhow = "1"
+futures = "0.3"
+bcdec_rs = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2

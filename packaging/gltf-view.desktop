@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=gltf-view
+Comment=Fast glTF / GLB viewer
+Exec=gltf-view %f
+Terminal=false
+Categories=Graphics;3DGraphics;Viewer;
+MimeType=model/gltf-binary;model/gltf+json;
