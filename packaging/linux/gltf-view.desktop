@@ -1,8 +1,12 @@
 [Desktop Entry]
 Type=Application
 Name=gltf-view
+GenericName=glTF Viewer
 Comment=Fast glTF / GLB viewer
 Exec=gltf-view %f
+Icon=gltf-view
 Terminal=false
 Categories=Graphics;3DGraphics;Viewer;
 MimeType=model/gltf-binary;model/gltf+json;
+Keywords=gltf;glb;3d;model;viewer;
+StartupWMClass=gltf-view

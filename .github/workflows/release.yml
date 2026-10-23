@@ -1,0 +1,203 @@
+name: Release
+
+# Pushing a tag vX.Y.Z (matching Cargo.toml) builds all packages and publishes a GitHub release.
+# Running the workflow manually builds and tests the packages without publishing (dry run);
+# they are attached to the workflow run as artifacts.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  LINUX_DEPS: >-
+    build-essential pkg-config clang libclang-dev cmake
+    libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev
+    libfontconfig1-dev libfreetype6-dev libvulkan-dev libzstd-dev libssl-dev
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Locate Windows SDK shader compiler and libclang
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+          "LIBCLANG_PATH=$env:ProgramFiles\LLVM\bin" >> $env:GITHUB_ENV
+
+      - run: cargo build --release --locked
+
+      - name: Check version
+        shell: pwsh
+        run: |
+          $out = & target\release\gltf-view.exe --version | Out-String
+          Write-Output $out
+          if ($out -notmatch [regex]::Escape("${{ needs.version.outputs.version }}")) { exit 1 }
+
+      - name: Portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist, stage | Out-Null
+          Copy-Item target\release\gltf-view.exe, README.md stage\
+          Copy-Item LICENSE stage\LICENSE.txt
+          Compress-Archive -Path stage\* -DestinationPath dist\gltf-view-windows-x64.zip
+
+      - name: Installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Qp "/DAppVersion=${{ needs.version.outputs.version }}" packaging\windows\gltf-view.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test installer (silent install, PATH, uninstall)
+        shell: pwsh
+        run: |
+          Start-Process dist\gltf-view-windows-x64-setup.exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/CURRENTUSER', '/TASKS=addtopath', '/NORESTART' -Wait
+          $dir = "$env:LOCALAPPDATA\Programs\gltf-view"
+          if (-not (Test-Path "$dir\gltf-view.exe")) { throw "gltf-view.exe was not installed to $dir" }
+          $path = (Get-ItemProperty HKCU:\Environment).Path
+          if ($path -notlike "*$dir*") { throw "install dir missing from user PATH: $path" }
+          Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES' -Wait
+          # The uninstaller relaunches itself from a temp copy; wait for it to finish.
+          function Done { -not (Test-Path "$dir\gltf-view.exe") -and ((Get-ItemProperty HKCU:\Environment).Path -notlike "*$dir*") }
+          for ($i = 0; $i -lt 60 -and -not (Done); $i++) { Start-Sleep -Milliseconds 500 }
+          if (Test-Path "$dir\gltf-view.exe") { throw "uninstall did not remove gltf-view.exe" }
+          $path = (Get-ItemProperty HKCU:\Environment).Path
+          if ($path -like "*$dir*") { throw "uninstall left the PATH entry: $path" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  linux:
+    needs: version
+    # Older glibc than any current distro, so the binary runs on Ubuntu 22.04+, Fedora, Arch/Omarchy, ...
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $LINUX_DEPS
+      - run: cargo build --release --locked
+
+      - name: Package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          ./target/release/gltf-view --version | grep -F "$VERSION"
+          echo "Shared libraries:" && readelf -d target/release/gltf-view | grep NEEDED
+          mkdir -p stage/gltf-view dist
+          cp target/release/gltf-view README.md LICENSE stage/gltf-view/
+          cp packaging/linux/install.sh packaging/linux/gltf-view.desktop packaging/linux/gltf-view-mime.xml stage/gltf-view/
+          cp assets/icon.png stage/gltf-view/gltf-view.png
+          chmod +x stage/gltf-view/install.sh stage/gltf-view/gltf-view
+          tar -C stage -czf dist/gltf-view-linux-x86_64.tar.gz gltf-view
+          sha=$(sha256sum dist/gltf-view-linux-x86_64.tar.gz | cut -d' ' -f1)
+          sed -e "s/@VERSION@/$VERSION/" -e "s/@SHA256@/$sha/" packaging/arch/PKGBUILD.in > dist/PKGBUILD
+
+      - name: Test install script
+        run: |
+          prefix="$RUNNER_TEMP/prefix"
+          PREFIX="$prefix" sh stage/gltf-view/install.sh
+          "$prefix/bin/gltf-view" --version
+          test -f "$prefix/share/applications/gltf-view.desktop"
+          PREFIX="$prefix" sh stage/gltf-view/install.sh --uninstall
+          test ! -e "$prefix/bin/gltf-view"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  # Builds and installs the generated PKGBUILD on Arch Linux (what Omarchy is based on).
+  arch:
+    needs: linux
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux
+          path: dist
+      - name: makepkg and install
+        run: |
+          pacman -Syu --noconfirm --needed base-devel
+          useradd -m builder
+          pkg=/home/builder/pkg
+          mkdir -p "$pkg" && cp dist/PKGBUILD "$pkg/"
+          version=$(grep '^pkgver=' "$pkg/PKGBUILD" | cut -d= -f2)
+          # Use the archive built above; the release it points to may not exist yet.
+          cp dist/gltf-view-linux-x86_64.tar.gz "$pkg/gltf-view-$version.tar.gz"
+          sed -i 's|^source=.*|source=("gltf-view-$pkgver.tar.gz")|' "$pkg/PKGBUILD"
+          chown -R builder "$pkg"
+          su builder -c "cd $pkg && makepkg --nodeps --noconfirm"
+          pacman -U --noconfirm "$pkg"/gltf-view-bin-*.pkg.tar.zst
+          gltf-view --version
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: [version, windows, linux, arch]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums and release notes
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          url="https://github.com/${{ github.repository }}/releases/download/v$VERSION"
+          awk -v v="$VERSION" '/^## \[/ { if (p) exit; if (index($0, "## [" v "]") == 1) { p = 1; next } } p' CHANGELOG.md > notes.md
+          cat >> notes.md <<EOF
+
+          ## Install
+
+          **Windows:** run \`gltf-view-windows-x64-setup.exe\` (adds gltf-view to the PATH and opens .gltf/.glb files on double-click), or unzip \`gltf-view-windows-x64.zip\`.
+
+          **Linux (any distro, x86_64):**
+          \`\`\`sh
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/packaging/linux/get.sh | VERSION=$VERSION sh
+          \`\`\`
+
+          **Arch / Omarchy (pacman package):**
+          \`\`\`sh
+          mkdir gltf-view && cd gltf-view && curl -LO $url/PKGBUILD && makepkg -si
+          \`\`\`
+          EOF
+          cat notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: gltf-view ${{ needs.version.outputs.version }}
+          body_path: notes.md
+          files: dist/*
+          prerelease: ${{ contains(needs.version.outputs.version, '-') }}

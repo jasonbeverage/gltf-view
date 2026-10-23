@@ -10,7 +10,10 @@ mod ui;
 use gpui::{App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 use std::path::PathBuf;
 
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 const USAGE: &str = "gltf-view [FILE]\n\
+    \x20 --version             print the version\n\
     \x20 --register            associate .gltf/.glb with gltf-view (Windows)\n\
     \x20 --unregister          remove the association\n\
     \x20 --render IN OUT.png [--anim N] [--time SECONDS] [--bones]\n\
@@ -18,9 +21,16 @@ const USAGE: &str = "gltf-view [FILE]\n\
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a.starts_with('-')) {
+        attach_console();
+    }
     match args.first().map(String::as_str) {
         Some("--help" | "-h") => {
-            println!("{USAGE}");
+            println!("gltf-view {VERSION}\n\n{USAGE}");
+            return Ok(());
+        }
+        Some("--version" | "-V") => {
+            println!("gltf-view {VERSION}");
             return Ok(());
         }
         Some("--register") => return assoc::register(),
@@ -131,5 +141,15 @@ fn memory_mb() -> f64 {
             .ok()
             .and_then(|s| s.split_whitespace().nth(1)?.parse::<f64>().ok())
             .map_or(0.0, |pages| pages * 4096.0 / (1024.0 * 1024.0))
+    }
+}
+
+/// Release builds on Windows are GUI-subsystem executables with no console;
+/// attach to the launching terminal so command-line output is visible.
+fn attach_console() {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+        AttachConsole(ATTACH_PARENT_PROCESS);
     }
 }

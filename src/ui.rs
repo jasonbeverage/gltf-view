@@ -1052,7 +1052,7 @@ impl Render for Viewer {
             _ => "No file".into(),
         };
         let gpu: SharedString = match &self.gpu_status {
-            Some(Ok(name)) => name.clone().into(),
+            Some(Ok(name)) => format!("v{} · {name}", crate::VERSION).into(),
             Some(Err(e)) => format!("GPU error: {e}").into(),
             None => "starting GPU…".into(),
         };

@@ -3,10 +3,38 @@
 A small, fast glTF 2.0 / GLB viewer written in Rust with [gpui](https://gpui.rs) and wgpu.
 
 ![gltf-view showing a meshopt + KTX2 model with the material inspector](screenshot.png)
+
 It shows the model and every property in the file: scene graph, meshes, materials
 (with color swatches and texture previews), textures, images, samplers, accessors
 (with decoded values), buffer views, buffers, animations, skins, cameras and root extensions.
 References are clickable: a material's `baseColorTexture` jumps to the texture, then to its image, and so on.
+
+## Install
+
+Downloads are on the [releases page](https://github.com/jasonbeverage/gltf-view/releases/latest).
+
+**Windows:** run `gltf-view-windows-x64-setup.exe`. It installs for your user without admin rights
+(or for all users), and has options to add `gltf-view` to the PATH and to open .gltf/.glb files on double-click.
+A portable `gltf-view-windows-x64.zip` is there too.
+
+**Linux (x86_64, any distro):** installs to `~/.local` and makes gltf-view the default for .gltf/.glb files.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jasonbeverage/gltf-view/main/packaging/linux/get.sh | sh
+```
+
+Run the same command again to update. To remove it, add `-s -- --uninstall` after `sh`.
+
+**Arch / Omarchy:** each release has a `PKGBUILD`, so pacman manages the install:
+
+```sh
+mkdir gltf-view && cd gltf-view
+curl -LO https://github.com/jasonbeverage/gltf-view/releases/latest/download/PKGBUILD
+makepkg -si
+```
+
+gltf-view needs a Vulkan driver on Linux (Mesa's `vulkan-radeon`/`vulkan-intel`, or NVIDIA's), which Omarchy
+installs by default. It runs natively on Wayland (Hyprland) and X11.
 
 ## Supported extensions
 
@@ -53,9 +81,10 @@ This writes per-user registry keys only (no admin). If you had already picked an
 for these extensions, Windows doesn't let other apps override that choice, so the Default Apps
 page for gltf-view opens and you choose it there once.
 
-### Linux
+### Linux from source
 
-`sh packaging/install-linux.sh` builds, installs to `~/.local`, and sets gltf-view as the default for both MIME types.
+`packaging/linux/install.sh` builds a release binary if needed, installs it to `~/.local` (or `PREFIX`),
+and sets gltf-view as the default for both MIME types. `--uninstall` removes it.
 
 ## Building
 
@@ -65,7 +94,8 @@ and libclang (used by bindgen for Basis Universal).
 - **Windows:** Visual Studio Build Tools, LLVM (`winget install LLVM.LLVM`). Release builds of gpui
   compile shaders with `fxc.exe` from the Windows SDK. If it isn't found automatically, set:
   `GPUI_FXC_PATH=C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\fxc.exe`
-- **Linux (Debian/Ubuntu):** `sudo apt install build-essential clang libclang-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libfontconfig-dev`
+- **Linux (Debian/Ubuntu):** `sudo apt install build-essential pkg-config clang libclang-dev cmake libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libvulkan-dev libfontconfig1-dev libfreetype6-dev`
+- **Linux (Arch/Omarchy):** `sudo pacman -S --needed base-devel rust clang cmake libxkbcommon-x11 wayland vulkan-icd-loader fontconfig`
 
 ```
 cargo build --release
@@ -87,3 +117,21 @@ cargo build --release
 
 The file is read into memory rather than memory-mapped on purpose: a mapping would lock the file on Windows,
 so re-exporting over it from Blender (or anything else) would fail while it's open in the viewer.
+
+## Versioning and releases
+
+gltf-view uses [Semantic Versioning](https://semver.org). The version lives in `Cargo.toml` and is shown by
+`gltf-view --version`, in the toolbar, and in the Windows file properties. Changes are collected under
+**Unreleased** in [CHANGELOG.md](CHANGELOG.md) as they land.
+
+To publish a release:
+
+```sh
+scripts/release.sh 0.2.0 --push
+```
+
+This bumps the version, moves the Unreleased notes under 0.2.0, commits, tags `v0.2.0` and pushes. The tag starts
+the [Release workflow](.github/workflows/release.yml), which builds and tests the Windows installer and zip, the Linux
+archive and the Arch package (installed in an Arch container), then publishes a GitHub release with those files,
+`SHA256SUMS` and the changelog notes. Versions with a suffix such as `0.2.0-beta.1` are marked as pre-releases.
+Running the workflow by hand from the Actions tab builds everything without publishing.

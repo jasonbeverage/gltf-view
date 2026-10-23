@@ -2,3 +2,6 @@
 *.sh text eol=lf
 *.desktop text eol=lf
 *.png binary
+PKGBUILD* text eol=lf
+*.yml text eol=lf
+*.ico binary
