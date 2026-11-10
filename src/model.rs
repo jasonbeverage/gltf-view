@@ -7,14 +7,21 @@
 //! KHR_mesh_quantization, KHR_texture_basisu (KTX2), EXT_texture_webp,
 //! KHR_texture_transform, KHR_materials_emissive_strength, KHR_materials_unlit,
 //! KHR_materials_pbrSpecularGlossiness and EXT_mesh_gpu_instancing.
+//!
+//! glTF 2.1 external assets (`files`, `externalAssets`, `node.externalAsset`)
+//! are resolved at load time: every referenced file is loaded once, its
+//! geometry, materials and images are appended to this model, and its default
+//! scene is instanced under each node that places it.
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
 use glam::{Mat4, Quat, Vec3};
 use rayon::prelude::*;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
@@ -251,7 +258,10 @@ pub struct Stats {
     pub buffers_ms: f32,
     pub geometry_ms: f32,
     pub images_ms: f32,
+    /// Loading and merging glTF 2.1 external assets.
+    pub externals_ms: f32,
     pub total_ms: f32,
+    pub external_files: usize,
     pub vertices: usize,
     pub triangles: usize,
 }
@@ -282,6 +292,10 @@ impl Buffers {
     }
 }
 
+/// Meshes an external asset places, relative to the placing node:
+/// (mesh index into `Model::mesh_prims`, matrix).
+pub type Placement = Arc<[(usize, Mat4)]>;
+
 pub struct Model {
     pub path: PathBuf,
     pub file_size: u64,
@@ -301,6 +315,9 @@ pub struct Model {
     pub node_parent: Vec<Option<usize>>,
     /// Morph target count per mesh.
     pub mesh_targets: Vec<usize>,
+    /// Per `externalAssets` entry, the meshes it places relative to the placing
+    /// node; `None` when its file could not be loaded.
+    pub external_parts: Vec<Option<Placement>>,
     pub min: Vec3,
     pub max: Vec3,
     pub stats: Stats,
@@ -378,6 +395,79 @@ pub fn component_type_name(ct: u64) -> &'static str {
 /// is found) whether the GPU can sample BC7, so it can be transcoded to that.
 pub fn load(path: &Path, bc7: &(dyn Fn() -> bool + Sync)) -> Result<Model> {
     let t0 = Instant::now();
+    let mut model = read_doc(path)?;
+    let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+
+    // Images, geometry and glTF 2.1 external assets decode concurrently.
+    let (images, (geometry, externals)) = rayon::join(
+        || timed(|| model.decode_images(&base_dir, bc7)),
+        || rayon::join(|| timed(|| model.decode_meshes()), || timed(|| load_externals(&model.json, path))),
+    );
+    model.images = images.0;
+    model.stats.images_ms = images.1;
+    let (prims, mesh_prims, warn) = geometry.0;
+    model.stats.geometry_ms = geometry.1;
+    model.primitives = prims;
+    model.mesh_prims = mesh_prims;
+    model.warnings.extend(warn);
+    for (i, img) in model.images.iter().enumerate() {
+        if let Err(e) = img {
+            model.warnings.push(format!("Image {i}: {e}"));
+        }
+    }
+
+    model.samplers = parse_samplers(&model.json);
+    model.textures = arr(&model.json, "textures")
+        .iter()
+        .map(|t| Texture { image: pick_texture_image(t, &model.images, Some), sampler: uget(t, "sampler") })
+        .collect();
+    model.materials = arr(&model.json, "materials").iter().map(parse_material).collect();
+    model.mesh_targets = model.mesh_targets();
+    model.node_parent = vec![None; arr(&model.json, "nodes").len()];
+    for (i, n) in arr(&model.json, "nodes").iter().enumerate() {
+        for c in arr(n, "children") {
+            if let Some(slot) = c.as_u64().and_then(|c| model.node_parent.get_mut(c as usize)) {
+                *slot = Some(i);
+            }
+        }
+    }
+    model.skins = model.parse_skins();
+    let (animations, anim_warnings) = model.parse_animations();
+    model.animations = animations;
+    model.warnings.extend(anim_warnings);
+
+    let t = Instant::now();
+    model.stats.external_files = externals.0.files.len();
+    model.merge_externals(externals.0, &base_dir, bc7);
+    model.stats.externals_ms = externals.1 + ms(t);
+
+    model.build_instances();
+
+    model.stats.total_ms = ms(t0);
+    Ok(model)
+}
+
+fn timed<T>(f: impl FnOnce() -> T) -> (T, f32) {
+    let t = Instant::now();
+    let v = f();
+    (v, ms(t))
+}
+
+fn parse_samplers(json: &Value) -> Vec<Sampler> {
+    arr(json, "samplers")
+        .iter()
+        .map(|s| Sampler {
+            mag_filter: uget(s, "magFilter").map(|x| x as u32),
+            min_filter: uget(s, "minFilter").map(|x| x as u32),
+            wrap_s: uget(s, "wrapS").unwrap_or(10497) as u32,
+            wrap_t: uget(s, "wrapT").unwrap_or(10497) as u32,
+        })
+        .collect()
+}
+
+/// Reads a glTF/GLB file: JSON, buffers and buffer views. Nothing is decoded yet.
+fn read_doc(path: &Path) -> Result<Model> {
+    let t0 = Instant::now();
     let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let read_ms = ms(t0);
 
@@ -424,7 +514,7 @@ pub fn load(path: &Path, bc7: &(dyn Fn() -> bool + Sync)) -> Result<Model> {
     let views = decode_views(&json, &buffers)?;
     let buffers_ms = ms(t);
 
-    let mut model = Model {
+    Ok(Model {
         path: path.to_path_buf(),
         file_size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
         is_glb,
@@ -442,73 +532,12 @@ pub fn load(path: &Path, bc7: &(dyn Fn() -> bool + Sync)) -> Result<Model> {
         animations: Vec::new(),
         node_parent: Vec::new(),
         mesh_targets: Vec::new(),
+        external_parts: Vec::new(),
         min: Vec3::ZERO,
         max: Vec3::ZERO,
         stats: Stats { read_ms, parse_ms, buffers_ms, ..Default::default() },
         warnings,
-    };
-
-    // Images and geometry decode concurrently.
-    let (images, geometry) = rayon::join(
-        || {
-            let t = Instant::now();
-            let images = model.decode_images(&base_dir, bc7);
-            (images, ms(t))
-        },
-        || {
-            let t = Instant::now();
-            let prims = model.decode_meshes();
-            (prims, ms(t))
-        },
-    );
-    model.images = images.0;
-    model.stats.images_ms = images.1;
-    let (prims, mesh_prims, warn) = geometry.0;
-    model.stats.geometry_ms = geometry.1;
-    model.primitives = prims;
-    model.mesh_prims = mesh_prims;
-    model.warnings.extend(warn);
-    for (i, img) in model.images.iter().enumerate() {
-        if let Err(e) = img {
-            model.warnings.push(format!("Image {i}: {e}"));
-        }
-    }
-
-    model.samplers = arr(&model.json, "samplers")
-        .iter()
-        .map(|s| Sampler {
-            mag_filter: uget(s, "magFilter").map(|x| x as u32),
-            min_filter: uget(s, "minFilter").map(|x| x as u32),
-            wrap_s: uget(s, "wrapS").unwrap_or(10497) as u32,
-            wrap_t: uget(s, "wrapT").unwrap_or(10497) as u32,
-        })
-        .collect();
-    model.textures = arr(&model.json, "textures")
-        .iter()
-        .map(|t| Texture { image: model.texture_image(t), sampler: uget(t, "sampler") })
-        .collect();
-    model.materials = arr(&model.json, "materials").iter().map(parse_material).collect();
-    model.mesh_targets = model
-        .mesh_prims
-        .iter()
-        .map(|r| model.primitives[r.clone()].iter().map(|p| p.target_count).max().unwrap_or(0))
-        .collect();
-    model.node_parent = vec![None; arr(&model.json, "nodes").len()];
-    for (i, n) in arr(&model.json, "nodes").iter().enumerate() {
-        for c in arr(n, "children") {
-            if let Some(slot) = c.as_u64().and_then(|c| model.node_parent.get_mut(c as usize)) {
-                *slot = Some(i);
-            }
-        }
-    }
-    model.skins = model.parse_skins();
-    let (animations, anim_warnings) = model.parse_animations();
-    model.animations = animations;
-    model.warnings.extend(anim_warnings);
-    model.build_instances();
-
-    model.stats.total_ms = ms(t0);
-    Ok(model)
+    })
 }
 
 fn ms(t: Instant) -> f32 {
@@ -974,28 +1003,28 @@ fn empty_primitive(index_in_mesh: usize, p: &Value) -> Primitive {
 
 impl Model {
     fn decode_images(&self, base: &Path, bc7: &(dyn Fn() -> bool + Sync)) -> Vec<std::result::Result<ImageData, String>> {
-        arr(&self.json, "images")
-            .par_iter()
-            .map(|img| {
-                let t = Instant::now();
-                let owned;
-                let bytes: &[u8] = if let Some(v) = uget(img, "bufferView") {
-                    self.view(v)
-                } else if let Some(uri) = img.get("uri").and_then(Value::as_str) {
-                    owned = load_uri(uri, base).map_err(|e| format!("{e:#}"))?;
-                    &owned
-                } else {
-                    return Err("image has no data".to_string());
-                };
-                let mime = img.get("mimeType").and_then(Value::as_str).unwrap_or("");
-                let mut data = decode_image(bytes, mime, bc7).map_err(|e| format!("{e:#}"))?;
-                data.decode_ms = ms(t);
-                if data.thumb.is_none() {
-                    data.thumb = Some(make_thumb(data.width, data.height, &data.mips[0]));
-                }
-                Ok(data)
-            })
-            .collect()
+        arr(&self.json, "images").par_iter().map(|img| self.decode_image_entry(img, base, bc7)).collect()
+    }
+
+    /// Decodes one `images` entry of this document (URIs resolve against `base`).
+    fn decode_image_entry(&self, img: &Value, base: &Path, bc7: &(dyn Fn() -> bool + Sync)) -> std::result::Result<ImageData, String> {
+        let t = Instant::now();
+        let owned;
+        let bytes: &[u8] = if let Some(v) = uget(img, "bufferView") {
+            self.view(v)
+        } else if let Some(uri) = img.get("uri").and_then(Value::as_str) {
+            owned = load_uri(uri, base).map_err(|e| format!("{e:#}"))?;
+            &owned
+        } else {
+            return Err("image has no data".to_string());
+        };
+        let mime = img.get("mimeType").and_then(Value::as_str).unwrap_or("");
+        let mut data = decode_image(bytes, mime, bc7).map_err(|e| format!("{e:#}"))?;
+        data.decode_ms = ms(t);
+        if data.thumb.is_none() {
+            data.thumb = Some(make_thumb(data.width, data.height, &data.mips[0]));
+        }
+        Ok(data)
     }
 
     /// Bytes of CPU-side data held: file/buffers, decoded views, vertices, pixels.
@@ -1036,16 +1065,19 @@ impl Model {
             img.mips = Vec::new();
         }
     }
+}
 
-    fn texture_image(&self, t: &Value) -> Option<usize> {
-        let ok = |i: usize| matches!(self.images.get(i), Some(Ok(_)));
-        ["KHR_texture_basisu", "EXT_texture_webp", "EXT_texture_avif", "MSFT_texture_dds"]
-            .iter()
-            .filter_map(|e| ext(t, e).and_then(|x| uget(x, "source")))
-            .chain(uget(t, "source"))
-            .find(|&i| ok(i))
-            .or_else(|| uget(t, "source"))
-    }
+/// The image a texture samples: the first decodable source among its image
+/// extensions and `source`. `map` turns the document's image indices into
+/// indices into `images`.
+fn pick_texture_image(t: &Value, images: &[std::result::Result<ImageData, String>], map: impl Fn(usize) -> Option<usize>) -> Option<usize> {
+    ["KHR_texture_basisu", "EXT_texture_webp", "EXT_texture_avif", "MSFT_texture_dds"]
+        .iter()
+        .filter_map(|e| ext(t, e).and_then(|x| uget(x, "source")))
+        .chain(uget(t, "source"))
+        .filter_map(&map)
+        .find(|&i| matches!(images.get(i), Some(Ok(_))))
+        .or_else(|| uget(t, "source").and_then(&map))
 }
 
 pub fn decode_image(bytes: &[u8], mime: &str, bc7: &(dyn Fn() -> bool + Sync)) -> Result<ImageData> {
@@ -1338,32 +1370,50 @@ impl Model {
         world
     }
 
+    /// Whether each node is reachable from the default scene.
+    fn scene_nodes(&self) -> Vec<bool> {
+        let nodes = arr(&self.json, "nodes");
+        let mut seen = vec![false; nodes.len()];
+        let mut stack = self.scene_roots();
+        while let Some(n) = stack.pop() {
+            if n < nodes.len() && !std::mem::replace(&mut seen[n], true) {
+                stack.extend(arr(&nodes[n], "children").iter().filter_map(|c| c.as_u64().map(|c| c as usize)));
+            }
+        }
+        seen
+    }
+
+    /// EXT_mesh_gpu_instancing transforms of a node (identity if it has none).
+    fn node_locals(&self, node: &Value) -> Vec<Mat4> {
+        match ext(node, "EXT_mesh_gpu_instancing").and_then(|e| e.get("attributes")) {
+            Some(attrs) => self.gpu_instances(attrs),
+            None => vec![Mat4::IDENTITY],
+        }
+    }
+
     fn build_instances(&mut self) {
         let nodes = arr(&self.json, "nodes");
         let world = self.world_matrices(|i| node_local_matrix(&nodes[i]));
-        let in_scene = {
-            let mut seen = vec![false; nodes.len()];
-            let mut stack = self.scene_roots();
-            while let Some(n) = stack.pop() {
-                if n < nodes.len() && !std::mem::replace(&mut seen[n], true) {
-                    stack.extend(arr(&nodes[n], "children").iter().filter_map(|c| c.as_u64().map(|c| c as usize)));
-                }
-            }
-            seen
-        };
+        let in_scene = self.scene_nodes();
         let mut out = Vec::new();
         for (ni, node) in nodes.iter().enumerate() {
             if !in_scene[ni] {
                 continue;
             }
+            // A loaded external asset replaces the node's own mesh.
+            if let Some(parts) = uget(node, "externalAsset").and_then(|a| self.external_parts.get(a)).and_then(Option::as_ref) {
+                for l in self.node_locals(node) {
+                    for &(mesh, m) in parts.iter() {
+                        let local = l * m;
+                        out.push(Instance { node: ni, mesh, matrix: world[ni] * local, local, skin: None });
+                    }
+                }
+                continue;
+            }
             let Some(mesh) = uget(node, "mesh").filter(|m| *m < self.mesh_prims.len()) else { continue };
             let skinned_prims = self.primitives[self.mesh_prims[mesh].clone()].iter().any(|p| p.joints.is_some() && p.weights.is_some());
             let skin = uget(node, "skin").filter(|s| *s < self.skins.len() && skinned_prims);
-            let locals = match ext(node, "EXT_mesh_gpu_instancing").and_then(|e| e.get("attributes")) {
-                Some(attrs) => self.gpu_instances(attrs),
-                None => vec![Mat4::IDENTITY],
-            };
-            for local in locals {
+            for local in self.node_locals(node) {
                 // Skinned meshes ignore their node transform; joints place them.
                 let matrix = if skin.is_some() { Mat4::IDENTITY } else { world[ni] * local };
                 out.push(Instance { node: ni, mesh, matrix, local, skin });
@@ -1521,7 +1571,302 @@ impl Model {
             .collect()
     }
 
+    fn mesh_targets(&self) -> Vec<usize> {
+        self.mesh_prims.iter().map(|r| self.primitives[r.clone()].iter().map(|p| p.target_count).max().unwrap_or(0)).collect()
+    }
+
     pub fn buffer_len(&self, i: usize) -> usize {
         self.buffers.get(i).len()
+    }
+}
+
+// ------------------------------------------------------------ external assets
+
+/// Deepest nesting of external assets that is followed.
+const MAX_EXTERNAL_DEPTH: usize = 32;
+
+/// glTF files placed through glTF 2.1 `externalAssets`, each loaded once.
+struct Externals {
+    files: Vec<ExternalFile>,
+    /// File placed by each of the root document's `externalAssets`.
+    root: Vec<Option<usize>>,
+    warnings: Vec<String>,
+}
+
+struct ExternalFile {
+    path: PathBuf,
+    model: Model,
+    /// File placed by each of this file's `externalAssets`.
+    assets: Vec<Option<usize>>,
+}
+
+/// Lexically resolves `.` and `..`, so a file reached through different
+/// relative paths is loaded once.
+fn normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir if out.file_name().is_some() => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Path of an image stored in its own file (not a data URI or bufferView).
+fn image_file(img: &Value, dir: &Path) -> Option<PathBuf> {
+    let uri = img.get("uri").and_then(Value::as_str).filter(|u| !u.starts_with("data:"))?;
+    Some(normalize(&dir.join(percent_decode(uri))))
+}
+
+/// Resolves each `externalAssets` entry of a document to the file it places.
+fn external_asset_paths(json: &Value, dir: &Path, origin: &str, warnings: &mut Vec<String>) -> Vec<Option<PathBuf>> {
+    let files = arr(json, "files");
+    arr(json, "externalAssets")
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let resolve = || -> Result<PathBuf> {
+                let fi = uget(a, "file").ok_or_else(|| anyhow!("no file"))?;
+                let f = files.get(fi).ok_or_else(|| anyhow!("file {fi} does not exist"))?;
+                let mime = f.get("mimeType").and_then(Value::as_str).unwrap_or("");
+                if !matches!(mime, "" | "model/gltf+json" | "model/gltf-binary") {
+                    bail!("file {fi} has unsupported mimeType {mime}");
+                }
+                match f.get("uri").and_then(Value::as_str) {
+                    Some(uri) if !uri.starts_with("data:") => Ok(normalize(&dir.join(percent_decode(uri)))),
+                    _ => bail!("file {fi} is embedded (bufferView or data URI), which is not supported yet"),
+                }
+            };
+            resolve().map_err(|e| warnings.push(format!("{origin}External asset {i}: {e:#}"))).ok()
+        })
+        .collect()
+}
+
+/// Reads an external glTF and decodes its geometry and materials. Its images
+/// are decoded later, together with (and shared between) all other files.
+fn load_external(path: &Path) -> Result<Model> {
+    let mut m = read_doc(path)?;
+    let (prims, mesh_prims, warn) = m.decode_meshes();
+    m.primitives = prims;
+    m.mesh_prims = mesh_prims;
+    m.warnings.extend(warn);
+    m.samplers = parse_samplers(&m.json);
+    m.materials = arr(&m.json, "materials").iter().map(parse_material).collect();
+    m.mesh_targets = m.mesh_targets();
+    for key in ["skins", "animations"] {
+        if !arr(&m.json, key).is_empty() {
+            m.warnings.push(format!("{key} in external assets are not supported; shown static"));
+        }
+    }
+    Ok(m)
+}
+
+/// Loads every file the document at `root` places, transitively. Each level
+/// of references loads in parallel; each distinct file is loaded once.
+fn load_externals(json: &Value, root: &Path) -> Externals {
+    let mut warnings = Vec::new();
+    let root_paths = external_asset_paths(json, root.parent().unwrap_or(Path::new("")), "", &mut warnings);
+    let root_key = normalize(root);
+    // Index into `files` once loaded; `None` while queued or after failing.
+    let mut index: HashMap<PathBuf, Option<usize>> = HashMap::new();
+    let mut files: Vec<(PathBuf, Model, Vec<Option<PathBuf>>)> = Vec::new();
+    let mut refs: Vec<Option<PathBuf>> = root_paths.clone();
+    loop {
+        let mut queue = Vec::new();
+        for p in refs.drain(..).flatten() {
+            if p == root_key {
+                warnings.push(format!("External asset {} is the file itself (reference cycle); skipped", p.display()));
+            } else if !index.contains_key(&p) {
+                index.insert(p.clone(), None);
+                queue.push(p);
+            }
+        }
+        if queue.is_empty() {
+            break;
+        }
+        let loaded: Vec<_> = queue.into_par_iter().map(|p| (load_external(&p), p)).collect();
+        for (r, p) in loaded {
+            match r {
+                Ok(m) => {
+                    let origin = format!("{}: ", p.display());
+                    let paths = external_asset_paths(&m.json, p.parent().unwrap_or(Path::new("")), &origin, &mut warnings);
+                    refs.extend(paths.iter().cloned());
+                    index.insert(p.clone(), Some(files.len()));
+                    files.push((p, m, paths));
+                }
+                Err(e) => warnings.push(format!("External asset {}: {e:#}", p.display())),
+            }
+        }
+    }
+    let lookup = |paths: &[Option<PathBuf>]| -> Vec<Option<usize>> {
+        paths.iter().map(|p| p.as_ref().and_then(|p| index.get(p).copied().flatten())).collect()
+    };
+    Externals {
+        root: lookup(&root_paths),
+        files: files.into_iter().map(|(path, model, paths)| ExternalFile { assets: lookup(&paths), path, model }).collect(),
+        warnings,
+    }
+}
+
+/// Meshes a file's default scene places, relative to the placing node, as
+/// (merged mesh index, matrix). Nested external assets are expanded.
+fn placed_parts(
+    fi: usize,
+    files: &[ExternalFile],
+    mesh_base: &[usize],
+    memo: &mut [Option<Placement>],
+    stack: &mut Vec<usize>,
+    warnings: &mut Vec<String>,
+) -> Placement {
+    if let Some(p) = &memo[fi] {
+        return p.clone();
+    }
+    let f = &files[fi];
+    let m = &f.model;
+    let nodes = arr(&m.json, "nodes");
+    let world = m.world_matrices(|i| node_local_matrix(&nodes[i]));
+    let in_scene = m.scene_nodes();
+    stack.push(fi);
+    let mut out = Vec::new();
+    for (ni, node) in nodes.iter().enumerate() {
+        if !in_scene[ni] {
+            continue;
+        }
+        if let Some(a) = uget(node, "externalAsset")
+            && let Some(g) = f.assets.get(a).copied().flatten()
+        {
+            if stack.contains(&g) {
+                warnings.push(format!("{}: external asset {a} forms a reference cycle; skipped", f.path.display()));
+            } else if stack.len() >= MAX_EXTERNAL_DEPTH {
+                warnings.push(format!("{}: external asset {a} is nested too deeply; skipped", f.path.display()));
+            } else {
+                let sub = placed_parts(g, files, mesh_base, memo, stack, warnings);
+                for l in m.node_locals(node) {
+                    out.extend(sub.iter().map(|&(mesh, mm)| (mesh, world[ni] * l * mm)));
+                }
+                continue;
+            }
+        }
+        if let Some(mesh) = uget(node, "mesh").filter(|&x| x < m.mesh_prims.len()) {
+            for l in m.node_locals(node) {
+                out.push((mesh_base[fi] + mesh, world[ni] * l));
+            }
+        }
+    }
+    stack.pop();
+    let parts: Placement = out.into();
+    memo[fi] = Some(parts.clone());
+    parts
+}
+
+impl Model {
+    /// Appends the external files' geometry, materials, textures and images to
+    /// this model, and works out what each root `externalAssets` entry places.
+    fn merge_externals(&mut self, ext: Externals, base: &Path, bc7: &(dyn Fn() -> bool + Sync)) {
+        let Externals { mut files, root, warnings } = ext;
+        self.warnings.extend(warnings);
+        if files.is_empty() {
+            self.external_parts = vec![None; root.len()];
+            return;
+        }
+
+        // Out-of-range indices in the root document must not start pointing
+        // at appended entries.
+        let (nimg, nsamp, ntex, nmat) = (self.images.len(), self.samplers.len(), self.textures.len(), self.materials.len());
+        for t in &mut self.textures {
+            t.image = t.image.filter(|&i| i < nimg);
+            t.sampler = t.sampler.filter(|&s| s < nsamp);
+        }
+        for mat in &mut self.materials {
+            for slot in [&mut mat.base_tex, &mut mat.mr_tex, &mut mat.normal_tex, &mut mat.occlusion_tex, &mut mat.emissive_tex] {
+                *slot = slot.filter(|s| s.texture < ntex);
+            }
+        }
+        for p in &mut self.primitives {
+            p.material = p.material.filter(|&m| m < nmat);
+        }
+
+        // Images stored in files are shared by path, with the root document
+        // and between external files, and decoded once.
+        let mut by_path: HashMap<PathBuf, usize> = HashMap::new();
+        for (i, img) in arr(&self.json, "images").iter().enumerate() {
+            if let Some(p) = image_file(img, base) {
+                by_path.entry(p).or_insert(i);
+            }
+        }
+        let first = self.images.len();
+        let mut jobs: Vec<(usize, &Value, &Path)> = Vec::new();
+        let image_maps: Vec<Vec<usize>> = files
+            .iter()
+            .enumerate()
+            .map(|(fi, f)| {
+                let dir = f.path.parent().unwrap_or(Path::new(""));
+                arr(&f.model.json, "images")
+                    .iter()
+                    .map(|img| {
+                        let next = first + jobs.len();
+                        match image_file(img, dir) {
+                            Some(p) => *by_path.entry(p).or_insert_with(|| {
+                                jobs.push((fi, img, dir));
+                                next
+                            }),
+                            None => {
+                                jobs.push((fi, img, dir));
+                                next
+                            }
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let decoded: Vec<_> = jobs.par_iter().map(|&(fi, img, dir)| files[fi].model.decode_image_entry(img, dir, bc7)).collect();
+        for (&(fi, img, _), r) in jobs.iter().zip(&decoded) {
+            if let Err(e) = r {
+                let name = img.get("uri").and_then(Value::as_str).filter(|u| !u.starts_with("data:")).unwrap_or("(embedded)");
+                self.warnings.push(format!("{}: image {name}: {e}", files[fi].path.display()));
+            }
+        }
+        self.images.extend(decoded);
+
+        let mut mesh_base = Vec::with_capacity(files.len());
+        for (f, map) in files.iter_mut().zip(&image_maps) {
+            let m = &mut f.model;
+            let origin = f.path.display();
+            self.warnings.extend(m.warnings.drain(..).map(|w| format!("{origin}: {w}")));
+            let (sampler_base, tex_base, mat_base, prim_base) = (self.samplers.len(), self.textures.len(), self.materials.len(), self.primitives.len());
+            let (nsamp, ntex, nmat) = (m.samplers.len(), arr(&m.json, "textures").len(), m.materials.len());
+            mesh_base.push(self.mesh_prims.len());
+            self.samplers.append(&mut m.samplers);
+            for t in arr(&m.json, "textures") {
+                self.textures.push(Texture {
+                    image: pick_texture_image(t, &self.images, |i| map.get(i).copied()),
+                    sampler: uget(t, "sampler").filter(|&s| s < nsamp).map(|s| s + sampler_base),
+                });
+            }
+            for mut mat in m.materials.drain(..) {
+                for slot in [&mut mat.base_tex, &mut mat.mr_tex, &mut mat.normal_tex, &mut mat.occlusion_tex, &mut mat.emissive_tex] {
+                    *slot = slot.filter(|s| s.texture < ntex).map(|s| TexSlot { texture: s.texture + tex_base, ..s });
+                }
+                self.materials.push(mat);
+            }
+            for mut p in m.primitives.drain(..) {
+                p.material = p.material.filter(|&i| i < nmat).map(|i| i + mat_base);
+                self.primitives.push(p);
+            }
+            self.mesh_prims.extend(m.mesh_prims.iter().map(|r| r.start + prim_base..r.end + prim_base));
+            self.mesh_targets.extend_from_slice(&m.mesh_targets);
+        }
+
+        let mut memo = vec![None; files.len()];
+        let (mut stack, mut warnings) = (Vec::new(), Vec::new());
+        self.external_parts = root
+            .iter()
+            .map(|f| f.map(|f| placed_parts(f, &files, &mesh_base, &mut memo, &mut stack, &mut warnings)))
+            .collect();
+        self.warnings.extend(warnings);
     }
 }

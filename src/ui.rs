@@ -58,6 +58,8 @@ pub enum Cat {
     Animations,
     Skins,
     Cameras,
+    ExternalAssets,
+    Files,
     Extensions,
     Warnings,
 }
@@ -78,6 +80,8 @@ impl Cat {
             Cat::Animations => "Animations",
             Cat::Skins => "Skins",
             Cat::Cameras => "Cameras",
+            Cat::ExternalAssets => "External Assets",
+            Cat::Files => "Files",
             Cat::Extensions => "Extensions",
             Cat::Warnings => "Warnings",
         }
@@ -97,6 +101,8 @@ impl Cat {
             Cat::Animations => "animations",
             Cat::Skins => "skins",
             Cat::Cameras => "cameras",
+            Cat::ExternalAssets => "externalAssets",
+            Cat::Files => "files",
             _ => return None,
         })
     }
@@ -115,6 +121,8 @@ impl Cat {
             Cat::Animations => "Animation",
             Cat::Skins => "Skin",
             Cat::Cameras => "Camera",
+            Cat::ExternalAssets => "External Asset",
+            Cat::Files => "File",
             _ => "",
         }
     }
@@ -134,6 +142,8 @@ const CATEGORIES: &[Cat] = &[
     Cat::Animations,
     Cat::Skins,
     Cat::Cameras,
+    Cat::ExternalAssets,
+    Cat::Files,
     Cat::Extensions,
     Cat::Warnings,
 ];
@@ -536,6 +546,7 @@ impl Viewer {
                         Cat::Accessors => accessor_details(m, idx, &mut d),
                         Cat::Buffers => field(&mut d, 0, "loaded bytes", fmt_bytes(m.buffer_len(idx) as u64)),
                         Cat::Animations => animation_details(m, idx, &mut d),
+                        Cat::ExternalAssets => external_asset_details(m, idx, &mut d),
                         Cat::Skins => {
                             if let Some(skin) = m.skins.get(idx) {
                                 field(&mut d, 0, "joints", skin.joints.len().to_string());
@@ -715,6 +726,14 @@ fn item_label(cat: Cat, v: &Value, i: usize, m: &Model) -> SharedString {
         )
         .into(),
         Cat::BufferViews => format!("{i}: {}", fmt_bytes(v.get("byteLength").and_then(Value::as_u64).unwrap_or(0))).into(),
+        Cat::Files => match v.get("uri").and_then(Value::as_str).filter(|u| !u.starts_with("data:")) {
+            Some(uri) if name_of(v).is_some() => format!("{base}  ({uri})").into(),
+            _ => base.into(),
+        },
+        Cat::ExternalAssets => match external_asset_file(m, i) {
+            Some(uri) => format!("{base}  ({uri})").into(),
+            None => base.into(),
+        },
         Cat::Images => match m.images.get(i) {
             Some(Ok(img)) => format!("{base}  ({}×{} {})", img.width, img.height, img.format).into(),
             _ => format!("{base}  (failed)").into(),
@@ -747,6 +766,7 @@ fn asset_details(m: &Model, upload_ms: f32, d: &mut Vec<Detail>) {
         ("images", "images"),
         ("animations", "animations"),
         ("skins", "skins"),
+        ("external assets", "externalAssets"),
     ] {
         field(d, 0, k, arr(j, key).len().to_string());
     }
@@ -760,6 +780,9 @@ fn asset_details(m: &Model, upload_ms: f32, d: &mut Vec<Detail>) {
     field(d, 0, "buffers + meshopt", format!("{:.1} ms", s.buffers_ms));
     field(d, 0, "geometry (parallel)", format!("{:.1} ms", s.geometry_ms));
     field(d, 0, "images (parallel)", format!("{:.1} ms", s.images_ms));
+    if s.external_files > 0 {
+        field(d, 0, format!("external assets ({} files)", s.external_files), format!("{:.1} ms", s.externals_ms));
+    }
     field(d, 0, "total decode", format!("{:.1} ms", s.total_ms));
     field(d, 0, "GPU upload", format!("{upload_ms:.1} ms"));
     for key in ["extensionsUsed", "extensionsRequired"] {
@@ -790,6 +813,27 @@ fn node_details(m: &Model, idx: usize, v: &Value, d: &mut Vec<Detail>) {
         let mesh = arr(&m.json, "meshes").get(mi as usize);
         let label = mesh.and_then(name_of).map_or_else(|| format!("Mesh {mi}"), str::to_string);
         link_field(d, 0, "mesh", label, (Cat::Meshes, mi as usize));
+    }
+    if let Some(ai) = v.get("externalAsset").and_then(Value::as_u64) {
+        let label = external_asset_file(m, ai as usize).map_or_else(|| format!("External Asset {ai}"), str::to_string);
+        link_field(d, 0, "external asset", label, (Cat::ExternalAssets, ai as usize));
+    }
+}
+
+/// URI of the file an `externalAssets` entry places.
+fn external_asset_file(m: &Model, idx: usize) -> Option<&str> {
+    let file = arr(&m.json, "externalAssets").get(idx)?.get("file")?.as_u64()?;
+    arr(&m.json, "files").get(file as usize)?.get("uri")?.as_str()
+}
+
+fn external_asset_details(m: &Model, idx: usize, d: &mut Vec<Detail>) {
+    match m.external_parts.get(idx).and_then(Option::as_ref) {
+        Some(parts) => {
+            let nodes = arr(&m.json, "nodes").iter().filter(|n| n.get("externalAsset").and_then(Value::as_u64) == Some(idx as u64)).count();
+            field(d, 0, "placing nodes", fmt_count(nodes));
+            field(d, 0, "meshes per placement", fmt_count(parts.len()));
+        }
+        None => field(d, 0, "status", "not loaded (see Warnings)"),
     }
 }
 
@@ -968,6 +1012,8 @@ fn link_target(key: &str, path: &[String]) -> Option<Cat> {
         "mesh" => Cat::Meshes,
         "material" => Cat::Materials,
         "camera" => Cat::Cameras,
+        "externalAsset" => Cat::ExternalAssets,
+        "file" if parent == "externalAssets" => Cat::Files,
         "skin" => Cat::Skins,
         "source" => Cat::Images,
         "bufferView" => Cat::BufferViews,

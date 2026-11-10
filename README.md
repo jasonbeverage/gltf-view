@@ -51,6 +51,18 @@ installs by default. It runs natively on Wayland (Hyprland) and X11.
 | `EXT_mesh_gpu_instancing` | rendered (instanced draws) |
 | everything else | shown in the property panel |
 
+## glTF 2.1 external assets
+
+Files that place other glTF files through glTF 2.1 `externalAssets` (`files[]` → `externalAssets[]` →
+`node.externalAsset`) open as one scene. Each referenced .gltf/.glb is loaded once, in parallel, and its
+default scene is instanced under every node that places it, so thousands of placements of the same asset
+share one copy of its geometry. Nested references are followed. Images shared between files (same path) are
+decoded once. The inspector lists `External Assets` and `Files`, and a node links to the asset it places.
+
+Not supported yet: external files embedded through a `bufferView` or data URI, `aliases`, and skins or
+animations inside placed files (they render static). Missing files and reference cycles show as warnings.
+A node whose file fails to load renders its own `mesh`, if it has one.
+
 ## Animation and skeletons
 
 All animations in the file can be played: node translation/rotation/scale, skinning (on the GPU, any
