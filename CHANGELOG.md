@@ -5,6 +5,8 @@ while the version is 0.x, minor versions may include breaking changes.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-10
+
 - glTF 2.1 external assets: `files`, `externalAssets` and `node.externalAsset` are resolved at load time.
   Referenced glTF/GLB files are loaded once (in parallel, including nested references), instanced under each
   placing node, and share decoded images. The inspector gains External Assets and Files sections.
